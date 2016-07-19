@@ -1,5 +1,5 @@
  {
-    "flashicon": "http://www.hugheaves.com/vera/resources/thermostat/3.1/thermostat_icon.png",
+    "flashicon": "http://www.hugheaves.com/vera/resources/thermostat/3.0/thermostat_icon.png",
     "iconText": "1",
     "imgIconBody": "",
     "imgIconDimmable": "",
@@ -635,7 +635,24 @@
                         ]
                     },
                     "ControlCode": "energy_normal"
+                },
+                {
+                    "ControlGroup": "8",
+                    "ControlType": "variable",
+                    "top": "3",
+                    "left": "1",
+                    "Display": {
+                        "Top": 120,
+                        "Left": 500,
+                        "Width": 100,
+                        "Height": 25, 
+                        "Service": "urn:micasaverde-com:serviceId:HVAC_OperatingState1",
+                        "Variable": "ModeState",
+                        "Value": "Idle"
+                    },
+                    "ControlCode": "hvac_state"
                 }
+
             ]
         },
         {
