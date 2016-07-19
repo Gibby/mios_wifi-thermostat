@@ -21,9 +21,9 @@ local luup = luup
 local string = string
 local require = require
 local math = math
-local log = require("L_" .. g_pluginName .. "_" .. "log")
-local util = require("L_" .. g_pluginName .. "_" .. "util")
-local json = require("L_" .. g_pluginName .. "_" .. "dkjson")
+local json = g_dkjson
+local log = g_log
+local util = g_util
 
 -- IMPORT REQUIRED MODULES
 local http = require("socket.http")
@@ -31,11 +31,11 @@ local http = require("socket.http")
 -- CONSTANTS
 
 -- Plug-in version
-local PLUGIN_VERSION = "3.1"
+local PLUGIN_VERSION = "3.0"
 
 local DEFAULT_POLL_INTERVAL = 60
 
-local DEFAULT_NUM_RETRIES = 10
+local DEFAULT_NUM_RETRIES = 3
 
 local LOG_PREFIX = "RTCOA"
 
@@ -94,6 +94,8 @@ local GENERIC_DEVICE_SIDS = {
 
 -- "Global" variables (global to the module, that is)
 local g_lastMetadataPollTime = nil
+local g_lastCachePollTime = nil
+local g_CachePollTime = 3600
 local g_lastRemoteTempPollTime = nil
 local g_nextPollTime = 0
 local g_temperatureFormat = nil
@@ -125,6 +127,9 @@ local TSTAT_API_TTEMP_PATH = "/tstat/ttemp"
 
 local TSTAT_API_SYSTEM_PATH = "/sys"
 -- Example GET response: {"uuid":"ffffffffffff","api_version":113,"fw_version":"1.04.73","wlan_fw_version":"v10.105576"
+
+local TSTAT_API_SYSTEM_REBOOT = "/sys/command"
+-- For rebooting thermostat when retries exceeded
 
 local TSTAT_API_SYSTEM_NAME_PATH = "/sys/name"
 -- Example GET response: {"name":"Dining Room"}
@@ -218,6 +223,13 @@ local function delocalizeTemp(temperature)
 	end
 end
 
+local function rebootThermostat(path, requestParameters)
+	local url = "http://" .. g_ipAddress .. path
+	util.httpGetJSON (url, requestParameters)
+	log.info ("Rebooted thermostat")
+end
+
+
 --- Call the thermostat API using the given path and request parameters.
 -- Will retry communications upon failure, unless noRetry is set to true.
 -- @parameter path
@@ -239,11 +251,17 @@ local function callThermostatAPI(path, responseValidationFunction, requestParame
 
 	repeat
 		-- if this is a retry, then we wait a little
+		luup.sleep(retries * 3000)
 		if (retries > 0) then
-			log.info("sleeping for ", retries * 1000, "ms before retrying request")
-			luup.sleep(retries * 1000)
 			log.info("retrying request, url = ", url, ", retry #", retries)
 		end
+
+		if (retries == numRetries and numRetries > 0) then
+			log.info ("Retries exceeded, rebooting thermostat...")
+			rebootThermostat(TSTAT_API_SYSTEM_REBOOT, { ["command"] = reboot } )
+			--luup.sleep(30000)
+			return (nil)
+		end	
 
 		local response = util.httpGetJSON (url, requestParameters)
 		if (not response) then
@@ -766,15 +784,45 @@ local function isValidProgramResponse(response)
 	return true
 end
 
+local function clearProgramCache()
+
+	local programTypes = { ["heat"] = "heat", ["cool"] = "cool"}
+
+	log.info ("Clearing program cache")
+	log.debug ("Initializing g_programs")
+	g_programs = util.getLuupVariable(RTCOA_WIFI_SID, "Programs", g_deviceId, util.T_TABLE)
+	log.debug("Current program cache: ", g_programs)
+	log.debug ("Retrieving current programs from thermostat")
+	local programs = {}
+	for programType, variable in pairs(programTypes) do
+		local path = TSTAT_API_PROGRAM_PATH .. "/" .. programType
+		local result = callThermostatAPI(path, isValidProgramResponse)
+		if (result) then
+			programs[programType] = result
+		else
+			return false
+		end
+	end
+	setLuupVariable(RTCOA_WIFI_SID, "Programs", programs, g_deviceId)
+	g_programs = programs
+	return true
+end
+
+
+
+
+
 --- Updates the cached thermostat programs. The reason we even cache the current programs
 -- is that the thermostat does nasty things (rapid cycling control relay on/off) when we call the
 -- API to retrieve (_not set_!!) the current program. It's a serious firmware bug in the
 -- thermostat, but it looks like it's not getting fixed. So, we avoid calling the thermostat
 -- "get program" API at all costs and just rely on the cached copy.
 local function updateProgramCache()
-	local programTypes = { ["heat"] = "heat", ["cool"] = "cool"}
 
-	if (g_programs == nil) then
+	log.debug ("Checking program cache.")
+	local programTypes = { ["heat"] = "heat", ["cool"] = "cool"}
+	
+	if (g_programs == nil or not g_programs) then
 		log.debug ("Initializing g_programs")
 		if (not util.getLuupVariable(RTCOA_WIFI_SID, "ProgramSetpoints", g_deviceId, util.T_BOOLEAN)) then
 			log.debug("ProgramSetpoints disabled, clearing cached programs")
@@ -812,14 +860,17 @@ end
 local function checkAndUpdateProgram(programType, day, setPoint)
 	log.debug ("checking program: programType = ", programType, ", day = ", day, ", setPoint = ", setPoint)
 	local days = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"}
-	local times = { 0, 540, 1020, 1260 }  -- 12am, 9am, 5pm, 9pm
+	--local times = { 0, 540, 1020, 1260 }  -- 12am, 9am, 5pm, 9pm
+	local times = { 0 }
+
+	updateProgramCache()
 
 	local program = g_programs[programType][tostring(day)]
 	log.debug ("current program = ", program)
 
 	local needsUpdate = false
 
-	if (#program ~= 8) then
+	if (#program ~= 2) then
 		log.debug ("Number of program entries does not match")
 		needsUpdate = true
 	else
@@ -865,33 +916,37 @@ local function programSetpoints ()
 
 	updateProgramCache()
 
-	if (g_programs and g_programs ~= "") then
-		if (g_thermostatTime == nil) then
-			log.debug ("g_thermostatTime is null - can't program setpoints")
-			return false
-		end
+	--if (g_programs and g_programs ~= "") then
+		--if (g_thermostatTime == nil) then
+			--log.debug ("g_thermostatTime is null - can't program setpoints")
+			--return false
+		--end
 
-		local secondsUntilMidnight = 86400 - ((g_thermostatTime.hour * 60 + g_thermostatTime.minute) * 60)
+		--local secondsUntilMidnight = 86400 - ((g_thermostatTime.hour * 60 + g_thermostatTime.minute) * 60)
 		local pollInterval = util.getLuupVariable(RTCOA_WIFI_SID, "PollInterval", g_deviceId, util.T_NUMBER)
-		local nextDay = nil
+		--local nextDay = nil
 		-- if we're within five polling intervals of the end of the day, check tomorrows schedule as well
-		if (secondsUntilMidnight <= (pollInterval * 5)) then
-			nextDay = g_thermostatTime.day + 1
-			if (nextDay > 6) then
-				nextDay = 0
-			end
-		end
+		--if (secondsUntilMidnight <= (pollInterval * 5)) then
+			--nextDay = g_thermostatTime.day + 1
+			--if (nextDay > 6) then
+				--nextDay = 0
+			--end
+		--end
 
 		for programType, sid in pairs(programTypes) do
 			local setPoint = util.getLuupVariable(sid, "CurrentSetpoint", g_deviceId, util.T_NUMBER)
 
-			checkAndUpdateProgram(programType, g_thermostatTime.day, setPoint)
-
-			if (nextDay) then
-				checkAndUpdateProgram(programType, nextDay, setPoint)
+			-- checkAndUpdateProgram(programType, g_thermostatTime.day, setPoint)
+			for eachDay=0,6,1 do
+				checkAndUpdateProgram(programType, eachDay, setPoint)
 			end
+
+			--if (nextDay) then
+				--checkAndUpdateProgram(programType, nextDay, setPoint)
+			--end
 		end
-	end
+	--end
+	return true
 end
 
 local function initGenericDeviceVariable(sid, variableName)
@@ -1017,6 +1072,19 @@ function thermostatPoller(pollAgain)
 		luup.call_delay("thermostatPoller", g_nextPollTime - currentTime, "true", true)
 		return
 	end
+	
+	if (not g_lastCachePollTime) then
+		g_lastCachePollTime = currentTime
+	end
+
+	-- Clear cache (default every 1 hour (3600 seconds)
+	if (currentTime - g_lastCachePollTime > g_CachePollTime) then
+		log.debug(currentTime, " - ", g_lastCachePollTime, " > ", g_CachePollTime)
+		log.info(g_CachePollTime, " seconds since last program cache update, clearing cached programs")
+		clearProgramCache()
+		g_lastCachePollTime = currentTime
+	end
+
 
 	if (not g_lastMetadataPollTime) then
 		g_lastMetadataPollTime = currentTime
@@ -1207,8 +1275,12 @@ function dispatchJob(lul_device, lul_settings, lul_job, serviceId, action)
 	serviceId == HEAT_SETPOINT_SID and action == "SetCurrentSetpoint" or
 	serviceId == COOL_SETPOINT_SID and action == "SetCurrentSetpoint" or
 	serviceId == TEMPERATURE_HOLD_SID and action == "SetTarget") then
-		-- change the setting
-		success = updateThermostatSetting (lul_settings, serviceId, action)
+		if (not util.getLuupVariable(RTCOA_WIFI_SID, "ProgramSetpoints", g_deviceId, util.T_BOOLEAN)) then
+			success = updateThermostatSetting (lul_settings, serviceId, action)
+		else
+			updateThermostatSetting (lul_settings, serviceId, action)
+			success = programSetpoints()
+		end
 		-- force at least 10 second delay until the next poll attempt
 		g_nextPollTime = os.time() + 10
 	elseif (serviceId == USER_OPERATING_MODE_SID and action == "SetEnergyModeTarget") then
